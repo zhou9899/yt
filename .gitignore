@@ -1,0 +1,4 @@
+node_modules/
+temp/
+*.mp4.part
+*.ytdl
