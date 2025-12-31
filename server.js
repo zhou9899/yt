@@ -1,128 +1,77 @@
-import express from "express";
-import cors from "cors";
-import { exec } from "child_process";
-import util from "util";
-import fs from "fs";
-import path from "path";
+import express from 'express';
+import bodyParser from 'body-parser';
+import ytld from 'yt-dlp-exec';
+import fs from 'fs';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
 
-const execPromise = util.promisify(exec);
 const app = express();
+app.use(bodyParser.json());
 
-app.use(cors());
-app.use(express.json());
+const DOWNLOAD_DIR = path.join(process.cwd(), 'downloads');
+if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 
-const PORT = process.env.PORT || 5000;
-const TEMP_DIR = path.join(process.cwd(), "temp");
+// Serve static downloads folder
+app.use('/downloads', express.static(DOWNLOAD_DIR));
 
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
-}
-
-/* ---------- HELPERS ---------- */
-
-// Convert shorts → watch URL
-function normalizeUrl(url) {
-  if (!url) return null;
-  const m = url.match(/youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/);
-  if (m) return `https://www.youtube.com/watch?v=${m[1]}`;
+// Convert Shorts URL to regular watch URL
+function convertShorts(url) {
+  const match = url.match(/youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/);
+  if (match) return `https://www.youtube.com/watch?v=${match[1]}`;
   return url;
 }
 
-// Base yt-dlp args (SINGLE LINE — IMPORTANT)
-function baseArgs() {
-  return [
-    "--force-ipv4",
-    "--user-agent \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15\"",
-    "--extractor-args \"youtube:player_client=web_safari\"",
-    "--geo-bypass",
-    "--no-playlist",
-    "--hls-prefer-native",
-    "--concurrent-fragments 8",
-    "--no-progress"
-  ].join(" ");
-}
-
-/* ---------- ROUTES ---------- */
-
-app.get("/ping", (_, res) => res.send("pong"));
-
-// Shorts test
-app.post("/test-shorts", (req, res) => {
-  const { url } = req.body;
-  res.json({ convertedUrl: normalizeUrl(url) });
-});
-
-// Search only
-app.post("/test-search", async (req, res) => {
-  const { search } = req.body;
-  if (!search) return res.status(400).json({ error: "Missing search" });
-
+// POST /download
+app.post('/download', async (req, res) => {
   try {
-    const { stdout } = await execPromise(
-      `yt-dlp "ytsearch5:${search}" --print "%(title)s"`
-    );
-    res.json({ result: stdout.trim().split("\n") });
-  } catch {
-    res.status(500).json({ error: "Search failed" });
-  }
-});
+    let { url, type } = req.body;
+    if (!url) return res.status(400).json({ error: 'URL required' });
 
-// Download endpoint
-app.post("/download", async (req, res) => {
-  const { url, search, type = "video" } = req.body;
+    url = convertShorts(url); // handle Shorts
+    const id = uuidv4();
+    const filename = type === 'audio' ? `${id}.mp3` : `${id}.mp4`;
+    const filepath = path.join(DOWNLOAD_DIR, filename);
 
-  const input = search
-    ? `ytsearch1:${search}`
-    : normalizeUrl(url);
+    const args = [
+      url,
+      '--force-ipv4',
+      '--geo-bypass',
+      '--no-playlist',
+      '--hls-prefer-native',
+      '--concurrent-fragments', '5',
+      '--no-progress',
+      '-o', filepath
+    ];
 
-  if (!input) {
-    return res.status(400).json({ error: "No URL or search provided" });
-  }
+    if (type === 'audio') {
+      args.push('-x', '--audio-format', 'mp3');
+    }
 
-  const id = `yt-${Date.now()}`;
-  const output = path.join(TEMP_DIR, `${id}.%(ext)s`);
-
-  let format;
-  let post = "";
-
-  if (type === "audio") {
-    format = `"bv*[protocol=m3u8]/ba*[protocol=m3u8]/best"`;
-    post = "-x --audio-format mp3";
-  } else {
-    format = `"bv*[protocol=m3u8]/best"`;
-  }
-
-  const cmd = `yt-dlp ${baseArgs()} -f ${format} ${post} -o "${output}" "${input}"`;
-
-  try {
-    await execPromise(cmd);
-
-    const files = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(id));
-    if (!files.length) throw new Error("No output file");
+    await ytld(args, { stdio: 'ignore' });
 
     res.json({
-      downloadUrl: `/file/${files[0]}`,
-      type
+      download_url: `${req.protocol}://${req.get('host')}/downloads/${filename}`,
+      message: `Downloaded successfully!`,
+      type,
     });
-
-  } catch (e) {
-    res.status(500).json({
-      error: "Failed to download",
-      details: e.stderr || e.message,
-      hint: "Local IPs are throttled. Railway/VPS works best."
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to download', details: err.message });
   }
 });
 
-// Serve downloaded file
-app.get("/file/:name", (req, res) => {
-  const filePath = path.join(TEMP_DIR, req.params.name);
-  if (!fs.existsSync(filePath)) return res.sendStatus(404);
-  res.download(filePath);
-});
+// Optional: cleanup old files every hour
+setInterval(() => {
+  const files = fs.readdirSync(DOWNLOAD_DIR);
+  files.forEach(file => {
+    const filePath = path.join(DOWNLOAD_DIR, file);
+    const stats = fs.statSync(filePath);
+    const now = Date.now();
+    if (now - stats.mtimeMs > 2 * 60 * 60 * 1000) { // older than 2 hours
+      fs.unlinkSync(filePath);
+    }
+  });
+}, 3600 * 1000);
 
-/* ---------- START ---------- */
-
-app.listen(PORT, () => {
-  console.log(`🚀 YouTube API running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
